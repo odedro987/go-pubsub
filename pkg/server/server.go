@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sync"
 
+	"github.com/odedro987/go-pubsub/pkg/maps"
 	"github.com/odedro987/go-pubsub/pkg/pubsub"
 )
 
@@ -40,12 +40,10 @@ type Server struct {
 	info     Info
 	listener net.Listener
 
-	mu sync.RWMutex
-
 	subscriptionQueue chan SubscribeMessage
 	queue             chan PublishMessage
-	topics            sync.Map // chan PublishMessage
-	clients           sync.Map // map[string]net.Conn
+	topics            maps.SyncMap[chan PublishMessage]
+	clients           maps.SyncMap[map[string]net.Conn]
 }
 
 func New(info Info) (*Server, error) {
@@ -53,8 +51,8 @@ func New(info Info) (*Server, error) {
 		info:              info,
 		queue:             make(chan PublishMessage, 1000),
 		subscriptionQueue: make(chan SubscribeMessage, 1000),
-		topics:            sync.Map{},
-		clients:           sync.Map{},
+		topics:            maps.New[chan PublishMessage](),
+		clients:           maps.New[map[string]net.Conn](),
 	}
 
 	l, err := net.Listen(string(info.ConnectionType), info.Address())
@@ -69,8 +67,8 @@ func New(info Info) (*Server, error) {
 func (s *Server) StartAccepting() {
 	log.Println("Start accepting connections")
 	defer func() {
-		s.clients.Range(func(topicName, clientsMap any) bool {
-			for _, client := range clientsMap.(map[string]net.Conn) {
+		s.clients.Range(func(topicName string, clientsMap map[string]net.Conn) bool {
+			for _, client := range clientsMap {
 				client.Close()
 			}
 			return true
@@ -138,7 +136,7 @@ func (s *Server) addTopic(name string) {
 					log.Printf("No subscribers in topic: %s\n", name)
 					continue
 				}
-				for _, client := range clientsMap.(map[string]net.Conn) {
+				for _, client := range clientsMap {
 					err := pubsub.SendMessage(client, message, pubsub.PublishMessage)
 					if err != nil {
 						log.Printf("Error sending message to client %s: %s", client.RemoteAddr().String(), err)
@@ -156,14 +154,14 @@ func (s *Server) addSubscriber(topic string, client net.Conn) {
 		s.clients.Store(topic, make(map[string]net.Conn))
 	}
 	clientsMap, _ := s.clients.Load(topic)
-	_, ok = (clientsMap.(map[string]net.Conn))[client.RemoteAddr().String()]
+	_, ok = clientsMap[client.RemoteAddr().String()]
 	if ok {
 		return
 	}
 
 	log.Printf("Subscribing %s to topic: %s\n", client.RemoteAddr().String(), topic)
 
-	(clientsMap.(map[string]net.Conn))[client.RemoteAddr().String()] = client
+	clientsMap[client.RemoteAddr().String()] = client
 }
 
 func (s *Server) StartQueuing() {
@@ -182,7 +180,7 @@ func (s *Server) StartQueuing() {
 				if !ok {
 					return
 				}
-				topicChannel.(chan PublishMessage) <- message
+				topicChannel <- message
 			}()
 		case message, ok := <-s.subscriptionQueue:
 			if !ok {
