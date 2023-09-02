@@ -1,10 +1,12 @@
 package client
 
 import (
-	"encoding/binary"
 	"encoding/json"
-	"go-pubsub/pkg/server"
+	"log"
 	"net"
+
+	"github.com/odedro987/go-pubsub/pkg/pubsub"
+	"github.com/odedro987/go-pubsub/pkg/server"
 )
 
 type Client struct {
@@ -33,6 +35,10 @@ func (c *Client) Connect(info server.Info) error {
 	return nil
 }
 
+func (c *Client) ConnectionClosed() bool {
+	return !c.connected
+}
+
 func (c *Client) Disconnect() error {
 	if !c.connected {
 		return nil
@@ -52,28 +58,58 @@ func (c *Client) Publish(topic string, message interface{}) error {
 		return nil
 	}
 
-	payload := server.InboundMessage{
+	payload := server.PublishMessage{
 		Topic: topic,
 		Data:  message,
 	}
 
-	bytes, err := json.Marshal(payload)
+	err := pubsub.SendMessage(c.conn, payload, pubsub.PublishMessage)
 	if err != nil {
+		c.connected = false
 		return err
 	}
 
-	messageLength := make([]byte, 4)
-	binary.LittleEndian.PutUint32(messageLength, uint32(len(bytes)))
+	return nil
+}
 
-	_, err = c.conn.Write(messageLength)
-	if err != nil {
-		return err
+func (c *Client) Subscribe(topics []string, handler func(msg *server.PublishMessage)) error {
+	if !c.connected {
+		return nil
 	}
 
-	_, err = c.conn.Write(bytes)
-	if err != nil {
-		return err
+	for _, topic := range topics {
+		payload := server.SubscribeMessage{
+			Topic: topic,
+		}
+
+		err := pubsub.SendMessage(c.conn, payload, pubsub.SubscribeMessage)
+		if err != nil {
+			c.connected = false
+			return err
+		}
 	}
+
+	go func(conn net.Conn) {
+		log.Println("Start accepting messages")
+		for {
+			defer conn.Close()
+			for {
+				bytes, _, err := pubsub.ReadMessage(conn)
+				if err != nil {
+					log.Println("Closed", conn.RemoteAddr().String())
+					c.connected = false
+					break
+				}
+				var msg server.PublishMessage
+				err = json.Unmarshal(bytes, &msg)
+				if err != nil {
+					log.Println(err.Error())
+					continue
+				}
+				handler(&msg)
+			}
+		}
+	}(c.conn)
 
 	return nil
 }
