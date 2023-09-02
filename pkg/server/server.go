@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
 
 	"github.com/odedro987/go-pubsub/pkg/pubsub"
 )
@@ -39,10 +40,12 @@ type Server struct {
 	info     Info
 	listener net.Listener
 
+	mu sync.RWMutex
+
 	subscriptionQueue chan SubscribeMessage
 	queue             chan PublishMessage
-	topics            map[string]chan PublishMessage
-	clients           map[string]map[string]net.Conn
+	topics            sync.Map // chan PublishMessage
+	clients           sync.Map // map[string]net.Conn
 }
 
 func New(info Info) (*Server, error) {
@@ -50,8 +53,8 @@ func New(info Info) (*Server, error) {
 		info:              info,
 		queue:             make(chan PublishMessage, 1000),
 		subscriptionQueue: make(chan SubscribeMessage, 1000),
-		topics:            make(map[string]chan PublishMessage),
-		clients:           make(map[string]map[string]net.Conn),
+		topics:            sync.Map{},
+		clients:           sync.Map{},
 	}
 
 	l, err := net.Listen(string(info.ConnectionType), info.Address())
@@ -66,11 +69,12 @@ func New(info Info) (*Server, error) {
 func (s *Server) StartAccepting() {
 	log.Println("Start accepting connections")
 	defer func() {
-		for _, clientsMap := range s.clients {
-			for _, client := range clientsMap {
+		s.clients.Range(func(topicName, clientsMap any) bool {
+			for _, client := range clientsMap.(map[string]net.Conn) {
 				client.Close()
 			}
-		}
+			return true
+		})
 	}()
 	for {
 		conn, err := s.listener.Accept()
@@ -112,28 +116,29 @@ func (s *Server) StartAccepting() {
 }
 
 func (s *Server) addTopic(name string) {
-	_, ok := s.topics[name]
+	_, ok := s.topics.Load(name)
 	if ok {
 		return
 	}
 	log.Println("Adding new topic: " + name)
 
-	s.topics[name] = make(chan PublishMessage)
+	topicChannel := make(chan PublishMessage)
+	s.topics.Store(name, topicChannel)
 	go func() {
 		for {
 			select {
-			case message, ok := <-s.topics[name]:
+			case message, ok := <-topicChannel:
 				if !ok {
 					log.Println("Channel is closed. Exiting.")
 					return
 				}
 				log.Printf("Topic: %s -> %v", name, message)
-				clientsMap, ok := s.clients[name]
+				clientsMap, ok := s.clients.Load(name)
 				if !ok {
 					log.Printf("No subscribers in topic: %s\n", name)
 					continue
 				}
-				for _, client := range clientsMap {
+				for _, client := range clientsMap.(map[string]net.Conn) {
 					err := pubsub.SendMessage(client, message, pubsub.PublishMessage)
 					if err != nil {
 						log.Printf("Error sending message to client %s: %s", client.RemoteAddr().String(), err)
@@ -146,18 +151,19 @@ func (s *Server) addTopic(name string) {
 }
 
 func (s *Server) addSubscriber(topic string, client net.Conn) {
-	clientsMap, ok := s.clients[topic]
+	_, ok := s.clients.Load(topic)
 	if !ok {
-		s.clients[topic] = make(map[string]net.Conn)
+		s.clients.Store(topic, make(map[string]net.Conn))
 	}
-	_, ok = clientsMap[client.RemoteAddr().String()]
+	clientsMap, _ := s.clients.Load(topic)
+	_, ok = (clientsMap.(map[string]net.Conn))[client.RemoteAddr().String()]
 	if ok {
 		return
 	}
 
 	log.Printf("Subscribing %s to topic: %s\n", client.RemoteAddr().String(), topic)
 
-	s.clients[topic][client.RemoteAddr().String()] = client
+	(clientsMap.(map[string]net.Conn))[client.RemoteAddr().String()] = client
 }
 
 func (s *Server) StartQueuing() {
@@ -172,7 +178,11 @@ func (s *Server) StartQueuing() {
 			go func() {
 				log.Println("Queuing message to " + message.Topic)
 				s.addTopic(message.Topic)
-				s.topics[message.Topic] <- message
+				topicChannel, ok := s.topics.Load(message.Topic)
+				if !ok {
+					return
+				}
+				topicChannel.(chan PublishMessage) <- message
 			}()
 		case message, ok := <-s.subscriptionQueue:
 			if !ok {
